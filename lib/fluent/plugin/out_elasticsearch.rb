@@ -2,6 +2,7 @@
 require 'date'
 require 'excon'
 require 'elasticsearch'
+require 'json'
 require 'uri'
 begin
   require 'strptime'
@@ -234,7 +235,10 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
   def send(data)
     retries = 0
     begin
-      client.bulk body: data
+      result = client.bulk body: data
+      if result["errors"]
+        log.warn "Errors occurred in bulk request"
+      end
     rescue *client.transport.host_unreachable_exceptions => e
       if retries < 2
         retries += 1
