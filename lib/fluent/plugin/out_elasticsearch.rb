@@ -177,6 +177,14 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
     ret
   end
 
+  def remove_dots(record)
+    ret = {}
+    record.each { |key, value|
+      ret[key.gsub('.','_')] = value
+    }
+    ret
+  end
+
   def write(chunk)
     bulk_message = []
 
@@ -186,6 +194,8 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
       end
 
       next unless record.is_a? Hash
+      record = remove_dots(record)
+
       if @target_index_key && record[@target_index_key]
         target_index = record.delete @target_index_key
       elsif @logstash_format
