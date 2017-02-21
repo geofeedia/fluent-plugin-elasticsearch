@@ -247,7 +247,8 @@ class Fluent::ElasticsearchOutput < Fluent::BufferedOutput
     begin
       result = client.bulk body: data
       if result["errors"]
-        log.warn "Errors occurred in bulk request"
+        log.error "Could not push log to Elasticsearch: "
+        log.error "#{result}"
       end
     rescue *client.transport.host_unreachable_exceptions => e
       if retries < 2
