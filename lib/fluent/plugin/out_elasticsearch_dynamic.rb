@@ -7,32 +7,30 @@ class Fluent::ElasticsearchOutputDynamic < Fluent::ElasticsearchOutput
 
   config_param :delimiter, :string, :default => "."
 
-  # params overloaded as strings
-  config_param :port, :string, :default => "9200"
-  config_param :logstash_format, :string, :default => "false"
-  config_param :utc_index, :string, :default => "true"
-  config_param :time_key_exclude_timestamp, :bool, :default => false
-  config_param :reload_connections, :string, :default => "true"
-  config_param :reload_on_failure, :string, :default => "false"
-  config_param :resurrect_after, :string, :default => "60"
-  config_param :ssl_verify, :string, :dfeault => "true"
+  DYNAMIC_PARAM_NAMES = %W[hosts host port include_timestamp logstash_format logstash_prefix logstash_dateformat time_key utc_index index_name tag_key type_name id_key parent_key routing_key write_operation]
+  DYNAMIC_PARAM_SYMBOLS = DYNAMIC_PARAM_NAMES.map { |n| "@#{n}".to_sym }
+
+  attr_reader :dynamic_config
 
   def configure(conf)
     super
 
     # evaluate all configurations here
-    @dynamic_params = self.instance_variables.select { |var| is_valid_expand_param_type(var) }
-    @dynamic_config = Hash.new
-    @dynamic_params.each { |var|
+    @dynamic_config = {}
+    DYNAMIC_PARAM_SYMBOLS.each_with_index { |var, i|
       value = expand_param(self.instance_variable_get(var), nil, nil, nil)
-      var = var[1..-1]
-      @dynamic_config[var] = value
+      key = DYNAMIC_PARAM_NAMES[i]
+      @dynamic_config[key] = value.to_s
     }
     # end eval all configs
     @current_config = nil
   end
 
-  def client(host)
+  def create_meta_config_map
+    {'id_key' => '_id', 'parent_key' => '_parent', 'routing_key' => '_routing'}
+  end
+
+  def client(host = nil)
 
     # check here to see if we already have a client connection for the given host
     connection_options = get_connection_options(host)
@@ -41,17 +39,23 @@ class Fluent::ElasticsearchOutputDynamic < Fluent::ElasticsearchOutput
 
     @_es ||= begin
       @current_config = connection_options[:hosts].clone
-      excon_options = { client_key: @dynamic_config['client_key'], client_cert: @dynamic_config['client_cert'], client_key_pass: @dynamic_config['client_key_pass'] }
+      excon_options = { client_key: @client_key, client_cert: @client_cert, client_key_pass: @client_key_pass }
       adapter_conf = lambda {|f| f.adapter :excon, excon_options }
       transport = Elasticsearch::Transport::Transport::HTTP::Faraday.new(connection_options.merge(
                                                                           options: {
-                                                                            reload_connections: @dynamic_config['reload_connections'],
-                                                                            reload_on_failure: @dynamic_config['reload_on_failure'],
-                                                                            resurrect_after: @dynamic_config['resurrect_after'].to_i,
+                                                                            reload_connections: @reload_connections,
+                                                                            reload_on_failure: @reload_on_failure,
+                                                                            resurrect_after: @resurrect_after,
                                                                             retry_on_failure: 5,
+                                                                            logger: @transport_logger,
                                                                             transport_options: {
-                                                                              request: { timeout: @dynamic_config['request_timeout'] },
-                                                                              ssl: { verify: @dynamic_config['ssl_verify'], ca_file: @dynamic_config['ca_file'] }
+                                                                              headers: { 'Content-Type' => 'application/json' },
+                                                                              request: { timeout: @request_timeout },
+                                                                              ssl: { verify: @ssl_verify, ca_file: @ca_file }
+                                                                            },
+                                                                            http: {
+                                                                              user: @user,
+                                                                              password: @password
                                                                             }
                                                                           }), &adapter_conf)
       es = Elasticsearch::Client.new transport: transport
@@ -68,20 +72,20 @@ class Fluent::ElasticsearchOutputDynamic < Fluent::ElasticsearchOutput
   end
 
   def get_connection_options(con_host)
-    raise "`password` must be present if `user` is present" if @dynamic_config['user'] && !@dynamic_config['password']
+    raise "`password` must be present if `user` is present" if @user && !@password
 
-    hosts = if con_host || @dynamic_config['hosts']
-      (con_host || @dynamic_config['hosts']).split(',').map do |host_str|
+    hosts = if con_host || @hosts
+      (con_host || @hosts).split(',').map do |host_str|
         # Support legacy hosts format host:port,host:port,host:port...
         if host_str.match(%r{^[^:]+(\:\d+)?$})
           {
             host:   host_str.split(':')[0],
-            port:   (host_str.split(':')[1] || @dynamic_config['port']).to_i,
-            scheme: @dynamic_config['scheme']
+            port:   (host_str.split(':')[1] || @port).to_i,
+            scheme: @scheme.to_s
           }
         else
           # New hosts format expects URLs such as http://logs.foo.com,https://john:pass@logs2.foo.com/elastic
-          uri = URI(host_str)
+          uri = URI(get_escaped_userinfo(host_str))
           %w(user password path).inject(host: uri.host, port: uri.port, scheme: uri.scheme) do |hash, key|
             hash[key.to_sym] = uri.public_send(key) unless uri.public_send(key).nil? || uri.public_send(key) == ''
             hash
@@ -89,10 +93,10 @@ class Fluent::ElasticsearchOutputDynamic < Fluent::ElasticsearchOutput
         end
       end.compact
     else
-      [{host: @dynamic_config['host'], port: @dynamic_config['port'].to_i, scheme: @dynamic_config['scheme']}]
+      [{host: @host, port: @port.to_i, scheme: @scheme.to_s}]
     end.each do |host|
-      host.merge!(user: @dynamic_config['user'], password: @dynamic_config['password']) if !host[:user] && @dynamic_config['user']
-      host.merge!(path: @dynamic_config['path']) if !host[:path] && @dynamic_config['path']
+      host.merge!(user: @user, password: @password) if !host[:user] && @user
+      host.merge!(path: @path) if !host[:path] && @path
     end
 
     {
@@ -108,26 +112,43 @@ class Fluent::ElasticsearchOutputDynamic < Fluent::ElasticsearchOutput
     end.join(', ')
   end
 
-  def write(chunk)
-    bulk_message = Hash.new { |h,k| h[k] = [] }
+  def write_objects(tag, chunk)
+    bulk_message = Hash.new { |h,k| h[k] = '' }
     dynamic_conf = @dynamic_config.clone
 
-    chunk.msgpack_each do |tag, time, record|
+    headers = {
+      UPDATE_OP => {},
+      UPSERT_OP => {},
+      CREATE_OP => {},
+      INDEX_OP => {}
+    }
+
+    chunk.msgpack_each do |time, record|
       next unless record.is_a? Hash
 
-      # evaluate all configurations here
-      @dynamic_params.each { |var|
-        k = var[1..-1]
-        v = self.instance_variable_get(var)
-        # check here to determine if we should evaluate
-        if dynamic_conf[k] != v
-          value = expand_param(v, tag, time, record)
-          dynamic_conf[k] = value
-        end
-      }
-      # end eval all configs
+      if @hash_config
+        record = generate_hash_id_key(record)
+      end
 
-      if eval(dynamic_conf['logstash_format'])
+      begin
+        # evaluate all configurations here
+        DYNAMIC_PARAM_SYMBOLS.each_with_index { |var, i|
+          k = DYNAMIC_PARAM_NAMES[i]
+          v = self.instance_variable_get(var)
+          # check here to determine if we should evaluate
+          if dynamic_conf[k] != v
+            value = expand_param(v, tag, time, record)
+            dynamic_conf[k] = value
+          end
+        }
+      # end eval all configs
+      rescue => e
+        # handle dynamic parameters misconfigurations
+        router.emit_error_event(tag, time, record, e)
+        next
+      end
+
+      if eval_or_val(dynamic_conf['logstash_format']) || eval_or_val(dynamic_conf['include_timestamp'])
         if record.has_key?("@timestamp")
           time = Time.parse record["@timestamp"]
         elsif record.has_key?(dynamic_conf['time_key'])
@@ -136,8 +157,10 @@ class Fluent::ElasticsearchOutputDynamic < Fluent::ElasticsearchOutput
         else
           record.merge!({"@timestamp" => Time.at(time).to_datetime.to_s})
         end
+      end
 
-        if eval(dynamic_conf['utc_index'])
+      if eval_or_val(dynamic_conf['logstash_format'])
+        if eval_or_val(dynamic_conf['utc_index'])
           target_index = "#{dynamic_conf['logstash_prefix']}-#{Time.at(time).getutc.strftime("#{dynamic_conf['logstash_dateformat']}")}"
         else
           target_index = "#{dynamic_conf['logstash_prefix']}-#{Time.at(time).strftime("#{dynamic_conf['logstash_dateformat']}")}"
@@ -145,18 +168,17 @@ class Fluent::ElasticsearchOutputDynamic < Fluent::ElasticsearchOutput
       else
         target_index = dynamic_conf['index_name']
       end
-    
+
       # Change target_index to lower-case since Elasticsearch doesn't
       # allow upper-case characters in index names.
       target_index = target_index.downcase
-       
+
       if @include_tag_key
         record.merge!(dynamic_conf['tag_key'] => tag)
       end
 
       meta = {"_index" => target_index, "_type" => dynamic_conf['type_name']}
 
-      @meta_config_map ||= { 'id_key' => '_id', 'parent_key' => '_parent', 'routing_key' => '_routing' }
       @meta_config_map.each_pair do |config_name, meta_key|
         if dynamic_conf[config_name] && record[dynamic_conf[config_name]]
           meta[meta_key] = record[dynamic_conf[config_name]]
@@ -173,19 +195,23 @@ class Fluent::ElasticsearchOutputDynamic < Fluent::ElasticsearchOutput
         @remove_keys.each { |key| record.delete(key) }
       end
 
-      append_record_to_messages(dynamic_conf["write_operation"], meta, record, bulk_message[host])
+      write_op = dynamic_conf["write_operation"]
+      append_record_to_messages(write_op, meta, headers[write_op], record, bulk_message[host])
     end
 
-    bulk_message.each do | hKey, array |
-      send(array, hKey) unless array.empty?
-      array.clear
+    bulk_message.each do |hKey, msgs|
+      send_bulk(msgs, hKey) unless msgs.empty?
+      msgs.clear
     end
   end
 
-  def send(data, host)
+  def send_bulk(data, host)
     retries = 0
     begin
-      client(host).bulk body: data
+      response = client(host).bulk body: data
+      if response['errors']
+        log.error "Could not push log to Elasticsearch: #{response}"
+      end
     rescue *client(host).transport.host_unreachable_exceptions => e
       if retries < 2
         retries += 1
@@ -195,7 +221,15 @@ class Fluent::ElasticsearchOutputDynamic < Fluent::ElasticsearchOutput
         retry
       end
       raise ConnectionFailure, "Could not push logs to Elasticsearch after #{retries} retries. #{e.message}"
+    rescue Exception
+      @_es = nil if @reconnect_on_error
+      raise
     end
+  end
+
+  def eval_or_val(var)
+    return var unless var.is_a?(String)
+    eval(var)
   end
 
   def expand_param(param, tag, time, record)
@@ -234,6 +268,7 @@ class Fluent::ElasticsearchOutputDynamic < Fluent::ElasticsearchOutput
   def is_existing_connection(host)
     # check if the host provided match the current connection
     return false if @_es.nil?
+    return false if @current_config.nil?
     return false if host.length != @current_config.length
 
     for i in 0...host.length
